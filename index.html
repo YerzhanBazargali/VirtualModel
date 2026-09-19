@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>3D-модель в дополненной реальности</title>
+    <title>3D-модель</title>
     <script type="module" src="https://unpkg.com/@google/model-viewer"></script>
     <style>
         * {
@@ -22,17 +22,192 @@
             height: 100vh;
             display: block;
         }
+        #status {
+            position: fixed;
+            top: 12px;
+            left: 12px;
+            font-family: system-ui, sans-serif;
+            font-size: 13px;
+            color: #234;
+            background: rgba(255,255,255,0.75);
+            padding: 6px 10px;
+            border-radius: 6px;
+            z-index: 10;
+            display: none;
+        }
+        #picker {
+            position: fixed;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            gap: 12px;
+            background: rgba(135,206,235,0.95);
+            font-family: system-ui, sans-serif;
+            z-index: 20;
+            text-align: center;
+            padding: 20px;
+        }
     </style>
 </head>
 <body>
-    <model-viewer 
-        src="model.glb" 
+    <div id="status"></div>
+
+    <model-viewer
+        id="viewer"
         alt="3D модель"
-        auto-rotate 
-        camera-controls 
-        ar 
-        ar-modes="webxr scene-viewer quick-look" 
+        auto-rotate
+        camera-controls
+        autoplay
         shadow-intensity="1">
     </model-viewer>
+
+    <div id="picker">
+        <p>Ошибка: файл <b>model.glb</b> не найден рядом со страницей.</p>
+    </div>
+
+    <script type="module">
+        const viewer = document.getElementById('viewer');
+        const statusEl = document.getElementById('status');
+        const picker = document.getElementById('picker');
+
+        function showStatus(text) {
+            statusEl.textContent = text;
+            statusEl.style.display = 'block';
+            clearTimeout(showStatus._t);
+            showStatus._t = setTimeout(() => { statusEl.style.display = 'none'; }, 4000);
+        }
+
+        // --- Разбор и пересборка GLB-контейнера ---
+
+        function parseGLB(buffer) {
+            const dv = new DataView(buffer);
+            const magic = dv.getUint32(0, true);
+            if (magic !== 0x46546C67) throw new Error('Это не valid .glb файл (неверная сигнатура)');
+            const length = dv.getUint32(8, true);
+            let offset = 12;
+            let json = null, bin = null;
+            while (offset < length) {
+                const chunkLength = dv.getUint32(offset, true);
+                const chunkType = dv.getUint32(offset + 4, true);
+                const chunkData = buffer.slice(offset + 8, offset + 8 + chunkLength);
+                if (chunkType === 0x4E4F534A) { // 'JSON'
+                    json = JSON.parse(new TextDecoder('utf-8').decode(chunkData));
+                } else if (chunkType === 0x004E4942) { // 'BIN\0'
+                    bin = chunkData;
+                }
+                offset += 8 + chunkLength;
+            }
+            if (!json) throw new Error('В .glb не найден JSON-чанк');
+            return { json, bin };
+        }
+
+        // Конвертация устаревшего KHR_materials_pbrSpecularGlossiness
+        // в стандартный pbrMetallicRoughness (иначе модель рендерится белой
+        // в браузере, хотя нормально показывается в Sketchfab/Windows Viewer)
+        function fixSpecGloss(json) {
+            const used = json.extensionsUsed || [];
+            if (!used.includes('KHR_materials_pbrSpecularGlossiness')) return false;
+            let changed = false;
+            (json.materials || []).forEach((mat) => {
+                const ext = mat.extensions && mat.extensions.KHR_materials_pbrSpecularGlossiness;
+                if (!ext) return;
+                const diffuseFactor = ext.diffuseFactor || [1, 1, 1, 1];
+                const glossiness = (ext.glossinessFactor !== undefined) ? ext.glossinessFactor : 1;
+                const specular = ext.specularFactor || [0, 0, 0];
+                const specAvg = (specular[0] + specular[1] + specular[2]) / 3;
+                mat.pbrMetallicRoughness = {
+                    baseColorFactor: diffuseFactor,
+                    metallicFactor: specAvg > 0.5 ? 1 : 0,
+                    roughnessFactor: Math.min(Math.max(1 - glossiness, 0), 1)
+                };
+                if (ext.diffuseTexture) mat.pbrMetallicRoughness.baseColorTexture = ext.diffuseTexture;
+                delete mat.extensions.KHR_materials_pbrSpecularGlossiness;
+                if (Object.keys(mat.extensions).length === 0) delete mat.extensions;
+                changed = true;
+            });
+            json.extensionsUsed = used.filter((e) => e !== 'KHR_materials_pbrSpecularGlossiness');
+            if (json.extensionsRequired) {
+                json.extensionsRequired = json.extensionsRequired.filter((e) => e !== 'KHR_materials_pbrSpecularGlossiness');
+            }
+            return changed;
+        }
+
+        function buildGLB(json, bin) {
+            let jsonBytes = new TextEncoder().encode(JSON.stringify(json));
+            const jsonPad = (4 - (jsonBytes.length % 4)) % 4;
+            if (jsonPad > 0) {
+                const padded = new Uint8Array(jsonBytes.length + jsonPad);
+                padded.set(jsonBytes);
+                padded.fill(0x20, jsonBytes.length);
+                jsonBytes = padded;
+            }
+            let binBytes = bin ? new Uint8Array(bin) : new Uint8Array(0);
+            if (bin) {
+                const binPad = (4 - (binBytes.length % 4)) % 4;
+                if (binPad > 0) {
+                    const padded = new Uint8Array(binBytes.length + binPad);
+                    padded.set(binBytes);
+                    binBytes = padded;
+                }
+            }
+            const totalLength = 12 + 8 + jsonBytes.length + (bin ? 8 + binBytes.length : 0);
+            const out = new ArrayBuffer(totalLength);
+            const dv = new DataView(out);
+            let offset = 0;
+            dv.setUint32(offset, 0x46546C67, true); offset += 4;
+            dv.setUint32(offset, 2, true); offset += 4;
+            dv.setUint32(offset, totalLength, true); offset += 4;
+            dv.setUint32(offset, jsonBytes.length, true); offset += 4;
+            dv.setUint32(offset, 0x4E4F534A, true); offset += 4;
+            new Uint8Array(out, offset, jsonBytes.length).set(jsonBytes);
+            offset += jsonBytes.length;
+            if (bin) {
+                dv.setUint32(offset, binBytes.length, true); offset += 4;
+                dv.setUint32(offset, 0x004E4942, true); offset += 4;
+                new Uint8Array(out, offset, binBytes.length).set(binBytes);
+                offset += binBytes.length;
+            }
+            return out;
+        }
+
+        // Проверяет .glb на известные проблемы совместимости. Если фикс не
+        // нужен (или не удалось разобрать файл), отдаём исходный URL как есть —
+        // не тратим память на пересборку файла, который и так в порядке.
+        // Пересобираем в blob только тогда, когда правка правда была нужна.
+        async function prepareModelUrl(arrayBuffer, originalUrl) {
+            try {
+                const { json, bin } = parseGLB(arrayBuffer);
+                const changed = fixSpecGloss(json);
+                if (changed) {
+                    showStatus('Материал модели переведён в современный формат (specular-glossiness → metallic-roughness)');
+                    const fixed = buildGLB(json, bin);
+                    return URL.createObjectURL(new Blob([fixed], { type: 'model/gltf-binary' }));
+                }
+            } catch (e) {
+                console.warn('Не удалось проверить материалы модели, показываю файл как есть:', e);
+            }
+            return originalUrl;
+        }
+
+        async function loadFromArrayBuffer(buf, originalUrl) {
+            viewer.src = await prepareModelUrl(buf, originalUrl);
+        }
+
+        // Пытаемся сразу загрузить model.glb, лежащий рядом со страницей
+        // (обычный сценарий: файл задеплоен вместе с index.html)
+        const MODEL_URL = 'model.glb';
+        fetch(MODEL_URL)
+            .then((res) => {
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                return res.arrayBuffer();
+            })
+            .then((buf) => loadFromArrayBuffer(buf, MODEL_URL))
+            .catch((err) => {
+                console.warn('model.glb не найден рядом со страницей:', err);
+                picker.style.display = 'flex';
+            });
+    </script>
 </body>
 </html>
